@@ -1,5 +1,7 @@
-﻿using System.Net.WebSockets;
+﻿using pdf_extractor.Configuration;
+using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json;
 
 
 namespace pdf_extractor.Services
@@ -17,37 +19,38 @@ namespace pdf_extractor.Services
         }
 
         // Login: fetch + cache + save token (skips if already cached)
-        //public static async Task RunAsync(AppCredentialsOptions creds, TokenCache cache)
-        //{
-        //    if (cache.TryGet(creds.Username, out _))
-        //    {
-        //        System.Diagnostics.Debug.WriteLine("[Opticat login] Reusing cached token.");
-        //        return;
-        //    }
+        public static async Task RunAsync(AppCredentialsOptions creds, TokenCache cache)
+        {
+            if (cache.TryGet(creds.Username, out _))
+            {
+                System.Diagnostics.Debug.WriteLine("[Opticat login] Reusing cached token.");
+                return;
+            }
 
-        //    var url = $"Login?UserName={Uri.EscapeDataString(creds.Username)}&Password={Uri.EscapeDataString(creds.Password)}";
+            var url = $"Login?UserName={Uri.EscapeDataString(creds.Username)}&Password={Uri.EscapeDataString(creds.Password)}";
 
-        //    try
-        //    {
-        //        var response = await Http.GetAsync(url);
-        //        var body = await response.Content.ReadAsStringAsync();
+            try
+            {
+                var response = await Http.GetAsync(url);
+                var body = await response.Content.ReadAsStringAsync();
 
-        //        var dto = JsonSerializer.Deserialize<LoginDto>(body, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-        //        if (!response.IsSuccessStatusCode || string.IsNullOrWhiteSpace(dto?.Token)) return;
+                var dto = JsonSerializer.Deserialize<LoginDto>(body, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (!response.IsSuccessStatusCode || string.IsNullOrWhiteSpace(dto?.Token))
+                {
+                    System.Diagnostics.Debug.WriteLine($"[Opticat login] FAILED. Status: {(int)response.StatusCode}");
+                    System.Diagnostics.Debug.WriteLine($"[Opticat login] Body:\n{body}");
+                    return;
+                }
 
-        //        cache.Set(creds.Username, dto.Token);
-        //        TokenPersistence.Save(creds.Username, dto.Token);
-        //        System.Diagnostics.Debug.WriteLine("[Opticat login] Token cached + saved.");
-
-        //        System.Diagnostics.Debug.WriteLine("[Opticat login] Token cached.");
-        //        System.Diagnostics.Debug.WriteLine($"[Opticat login] Status: {(int)response.StatusCode}");
-        //        System.Diagnostics.Debug.WriteLine($"[Opticat login] Body:\n{body}");
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        Console.WriteLine($"[Opticat login] FAILED: {ex.Message}");
-        //    }
-        //}
+                cache.Set(creds.Username, dto.Token);
+                TokenPersistence.Save(creds.Username, dto.Token);
+                System.Diagnostics.Debug.WriteLine("[Opticat login] Token cached + saved.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Opticat login] FAILED: {ex.Message}");
+            }
+        }
 
         // --- WebSocket state ---
         private static ClientWebSocket? _ws;
