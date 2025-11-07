@@ -8,5 +8,6 @@
         public string DefaultLocation { get; set; } = "";
         public string InboundPdfFolder { get; set; } = "";
         public string ArchivedPdfFolder { get; set; } = "";
+        public string FailedPdfFolder { get; set; } = "";
     }
 }
