@@ -89,14 +89,8 @@ namespace pdf_extractor.Services
             _ = Task.Run(ReceiveLoopAsync);  // start simple background receiver
         }
 
-        public static async Task<(List<string> available, List<string> unavailable, string? rawResponse)> CheckPriceAvailabilityAsync(
-                AppCredentialsOptions creds,
-                string channel,
-                IEnumerable<LineItem> items,
-                string zipCode = "49311"  // default—you can wire to config later
-            )
+        public static async Task<(List<string> available, List<string> unavailable, string? rawResponse)> CheckPriceAvailabilityAsync (AppCredentialsOptions creds,string channel, IEnumerable<LineItem> items, string zipCode = "49311")
         {
-            // Build the WebSocket payload (PriceCheck)
             var messageObject = new
             {
                 channel,
@@ -106,12 +100,7 @@ namespace pdf_extractor.Services
                     RequestType = "PriceCheck",
                     PartBrand = (items ?? Enumerable.Empty<LineItem>())
                         .Where(i => !string.IsNullOrWhiteSpace(i.PartNumber))
-                        .Select(i => new
-                        {
-                            Brand = "HBWN",
-                            Part = i.PartNumber,
-                            MFG = "LF"
-                        })
+                        .Select(i => new { Brand = "HBWN", Part = i.PartNumber, MFG = "LF" })
                         .ToArray(),
                     ZipCode = zipCode
                 }
@@ -123,75 +112,109 @@ namespace pdf_extractor.Services
                 WriteIndented = true
             });
 
-            // Send over WS
             Debug.WriteLine($"[P&A] WS PriceCheck payload:\n{messageJson}");
+
+            // 🔴 IMPORTANT: clear last response before sending
+            _lastWsResponse = null;
+
+            await Task.Delay(200);
+
             await WsSendAsync(messageJson);
 
-            // Give the server a moment to respond and let ReceiveLoop stash it.
-            await Task.Delay(1500);
+            // 🔴 Wait up to ~5 seconds for a new response
+            var sw = Stopwatch.StartNew();
+            while (_lastWsResponse == null && sw.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                await Task.Delay(200);
+            }
 
-            var raw = GetLastWsResponse();
+            var raw = _lastWsResponse;
             var available = new List<string>();
             var unavailable = new List<string>();
 
-            if (!string.IsNullOrEmpty(raw))
+            if (string.IsNullOrEmpty(raw))
             {
-                try
+                Debug.WriteLine("[P&A] No WS response received for PriceCheck.");
+                return (available, unavailable, raw);
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(raw);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("data", out var dataArray) && dataArray.ValueKind == JsonValueKind.Array)
                 {
-                    using var doc = JsonDocument.Parse(raw);
-                    var root = doc.RootElement;
-
-                    if (root.TryGetProperty("data", out var dataArray) && dataArray.ValueKind == JsonValueKind.Array)
+                    foreach (var item in dataArray.EnumerateArray())
                     {
-                        foreach (var item in dataArray.EnumerateArray())
+                        if (item.TryGetProperty("responseDetails", out var details) &&
+                            details.ValueKind == JsonValueKind.Array)
                         {
-                            // responseStatus could be "success" / "Success" / etc.
-                            // Prefer inspecting responseDetails.
-                            if (item.TryGetProperty("responseDetails", out var details) && details.ValueKind == JsonValueKind.Array)
+                            foreach (var detail in details.EnumerateArray())
                             {
-                                foreach (var detail in details.EnumerateArray())
+                                var part = detail.TryGetProperty("Part", out var partEl)
+                                    ? (partEl.GetString() ?? "")
+                                    : "";
+
+                                if (string.IsNullOrWhiteSpace(part))
+                                    continue;
+
+                                bool hasValidPrice =
+                                    detail.TryGetProperty("Price", out var priceProp) &&
+                                    !string.IsNullOrWhiteSpace(priceProp.GetString());
+
+                                var location = detail.TryGetProperty("location", out var locArray) &&
+                                               locArray.ValueKind == JsonValueKind.Array
+                                    ? locArray.EnumerateArray().FirstOrDefault(loc =>
+                                        loc.TryGetProperty("locationid", out var locIdEl) &&
+                                        locIdEl.GetString() == creds.LocationId)
+                                    : default;
+
+                                bool matchedLocation = location.ValueKind == JsonValueKind.Object;
+
+                                bool qtyGreaterThanZero = false;
+                                bool backorderAllowed = false;
+
+                                if (matchedLocation)
                                 {
-                                    var part = detail.TryGetProperty("Part", out var partEl) ? (partEl.GetString() ?? "") : "";
-
-                                    // Heuristic: if sellerdetails exists and has at least one entry → available
-                                    bool hasSeller =
-                                        detail.TryGetProperty("sellerdetails", out var sellers) &&
-                                        sellers.ValueKind == JsonValueKind.Array &&
-                                        sellers.GetArrayLength() > 0;
-
-                                    bool hasLocationWithQty =
-                                        detail.TryGetProperty("location", out var locations) &&
-                                        locations.ValueKind == JsonValueKind.Array &&
-                                        locations.EnumerateArray().Any(loc =>
-                                            loc.TryGetProperty("qty", out var qtyEl) &&
-                                            int.TryParse(qtyEl.GetString(), out var qtyVal) &&
-                                            qtyVal > 0);
-
-                                    bool hasValidPriceFields =
-                                        detail.TryGetProperty("price_Qty", out var priceQtyProp) &&
-                                        !string.IsNullOrWhiteSpace(priceQtyProp.GetString()) &&
-                                        detail.TryGetProperty("Price", out var priceProp) &&
-                                        !string.IsNullOrWhiteSpace(priceProp.GetString());
-
-                                    if (!string.IsNullOrWhiteSpace(part))
+                                    if (location.TryGetProperty("qty", out var qtyEl) &&
+                                        int.TryParse(qtyEl.GetString(), out var qtyVal))
                                     {
-                                        if (hasSeller && hasLocationWithQty && hasValidPriceFields)
-                                            available.Add(part);
-                                        else
-                                            unavailable.Add(part);
+                                        qtyGreaterThanZero = qtyVal > 0;
                                     }
+
+                                    if (location.TryGetProperty("backorder", out var backorderEl))
+                                    {
+                                        backorderAllowed = backorderEl.GetString() == "1";
+                                    }
+                                }
+
+                                bool isAvailable =
+                                    hasValidPrice &&
+                                    matchedLocation &&
+                                    (qtyGreaterThanZero || backorderAllowed);
+
+                                if (isAvailable)
+                                {
+                                    Debug.WriteLine($"[P&A] Part {part} available at location {creds.LocationId}.");
+                                    available.Add(part);
+                                }
+                                else
+                                {
+                                    Debug.WriteLine($"[P&A] Part {part} unavailable.");
+                                    unavailable.Add(part);
                                 }
                             }
                         }
                     }
                 }
-                catch (JsonException)
-                {
-                    // If the schema differs, we’ll keep raw and empty lists.
-                }
+            }
+            catch (JsonException)
+            {
+                Debug.WriteLine("[P&A] JSON parse error: unexpected schema");
             }
 
-            // NEW: Write unavailable parts to a log file
+            // Write unavailable parts to a log file
             if (unavailable.Count > 0)
             {
                 try
@@ -286,7 +309,7 @@ namespace pdf_extractor.Services
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[WS error] " + ex.Message);
+                Debug.WriteLine("[WS error] " + ex.Message);
             }
         }
 

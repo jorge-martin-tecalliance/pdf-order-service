@@ -12,6 +12,7 @@ namespace pdf_order_service
         private readonly AppCredentialsOptions creds;
         private readonly TokenCache cache = new();
         private FileSystemWatcher? watcher;
+        private string? _wsChannel;
 
         private readonly string inboundPdfFolder;
         private readonly string archivedPdfFolder;
@@ -82,7 +83,7 @@ namespace pdf_order_service
         // Ensure valid token and Web Socket connection
         private async Task EnsureConnectedAsync()
         {
-            if (TokenPersistence.TryLoad(creds.Username, out var savedToken))
+            if (TokenPersistence.TryLoad(creds.Username, creds.TokenExpirationHours, out var savedToken))
             {
                 cache.Set(creds.Username, savedToken);
                 Debug.WriteLine("[TOKEN] Loaded from disk.");
@@ -93,8 +94,10 @@ namespace pdf_order_service
             if (!cache.TryGet(creds.Username, out var token))
                 throw new InvalidOperationException("No token available. Please check credentials.");
 
-            var channel = $"{creds.Username}client{DateTime.Now:HHmmss}";
-            await MsApiCalls.WsConnectAsync(creds.Username, token, channel);
+            if (_wsChannel == null)
+                _wsChannel = $"{creds.Username}client{DateTime.Now:HHmmss}";
+
+            await MsApiCalls.WsConnectAsync(creds.Username, token, _wsChannel);
         }
 
         // Processes the extracted order — checks price/availability, sends the order, and handles file archiving.
@@ -103,7 +106,7 @@ namespace pdf_order_service
             if (!cache.TryGet(creds.Username, out var token))
                 throw new InvalidOperationException("Token missing before order processing.");
 
-            var channel = $"{creds.Username}client{DateTime.Now:HHmmss}";
+            var channel = _wsChannel!;
 
             var (available, unavailable, _) =
                 await MsApiCalls.CheckPriceAvailabilityAsync(creds, channel, order.Items ?? new List<LineItem>());
@@ -111,6 +114,44 @@ namespace pdf_order_service
             if (!available.Any())
             {
                 Debug.WriteLine("[ORDER] No available parts — skipping order send.");
+
+                try
+                {
+                    string failedLogFolder = failedPdfFolder;
+                    Directory.CreateDirectory(failedLogFolder);
+
+                    // Build error log
+                    string logFileName = Path.GetFileNameWithoutExtension(pdfPath) + "_ErrorLog.txt";
+                    string logFilePath = Path.Combine(failedLogFolder, logFileName);
+                    string unavailableList = unavailable.Any()
+                        ? string.Join(", ", unavailable)
+                        : "All parts unavailable (quantity = 0 or missing price)";
+
+                    string logMessage =
+                        "[FAILED ORDER LOG]\n" +
+                        $"Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n" +
+                        $"PDF File: {pdfPath}\n" +
+                        $"Order Failed: {unavailableList}\n" +
+                        "------------------------------------------------------------\n";
+
+                    await File.WriteAllTextAsync(logFilePath, logMessage);
+
+                    // Move files to FailedPDF folder
+                    Directory.CreateDirectory(failedPdfFolder);
+                    string targetPdfPath = Path.Combine(failedPdfFolder, Path.GetFileName(pdfPath));
+                    string jsonPath = Path.ChangeExtension(pdfPath, ".json");
+                    string targetJsonPath = Path.Combine(failedPdfFolder, Path.GetFileName(jsonPath));
+
+                    if (File.Exists(pdfPath)) File.Move(pdfPath, targetPdfPath, true);
+                    if (File.Exists(jsonPath)) File.Move(jsonPath, targetJsonPath, true);
+
+                    Debug.WriteLine($"[ORDER] Moved PDF/JSON to FailedPDF: {failedPdfFolder}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[ORDER ERROR] Failed to move or log failed order: {ex.Message}");
+                }
+
                 return;
             }
 
